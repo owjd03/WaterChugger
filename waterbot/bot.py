@@ -219,7 +219,8 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         profile.step = Step.TIMEZONE
         await update.effective_message.reply_text(
             f"Nice to meet you, {name}. Share your location so I can determine your timezone. "
-            "The coordinates are not saved. You can instead send /timezone Area/City.",
+            "The coordinates are not saved. If location sharing does not work, send:\n\n"
+            "/timezone Asia/Singapore",
             reply_markup=location_keyboard(),
         )
         return
@@ -241,7 +242,7 @@ async def location_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
     if not timezone_name:
         await update.effective_message.reply_text(
-            "I couldn’t determine that timezone. Send it as /timezone Area/City."
+            "I couldn’t determine that timezone. Send:\n\n/timezone Asia/Singapore"
         )
         return
     profile.timezone = timezone_name
@@ -261,7 +262,8 @@ async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not context.args:
         profile.step = Step.TIMEZONE
         await update.effective_message.reply_text(
-            "Send /timezone followed by an IANA timezone such as Asia/Singapore, or share your location.",
+            "Send your timezone like this:\n\n/timezone Asia/Singapore\n\n"
+            "Or use the button to share your location.",
             reply_markup=location_keyboard(),
         )
         return

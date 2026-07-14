@@ -16,7 +16,7 @@ def test_config_uses_privacy_first_defaults(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 def test_missing_token_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "")
     with pytest.raises(ConfigError, match="TELEGRAM_BOT_TOKEN"):
         Config.from_env()
 
