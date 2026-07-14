@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+import random
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -37,6 +38,21 @@ SINGAPORE = ZoneInfo("Asia/Singapore")
 AWAKE_TEXT = "☀️ I'm awake"
 SLEEP_TEXT = "😴 I'm going to sleep"
 
+# Edit this tuple to add, remove, or rewrite the messages shown after Drank it.
+DRINK_ENCOURAGEMENT_MESSAGES = (
+    "Hydration unlocked! 💧✨",
+    "Water you waiting for? You crushed it! 🌊😄",
+    "Your kidneys just sent a thank-you note. 💌",
+    "Achievement unlocked: Sip happens! 🏆💦",
+    "Hydration station: mission complete! 🚰✅",
+    "Look at you, making your cells very happy! 🧬🎉",
+    "One small sip for you, one giant splash for hydration! 🚀💧",
+    "Keep calm and chug on! 😎🥤",
+    "Your inner houseplant is thriving! 🪴💦",
+    "Splish splash, excellent choice! 🐳✨",
+    "Lebron drinks water too nice one",
+)
+
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
@@ -46,6 +62,11 @@ def format_singapore(value: datetime | None) -> str:
     if value is None:
         return "Never"
     return value.astimezone(SINGAPORE).strftime("%d %b %Y, %H:%M SGT")
+
+
+def drink_confirmation_message(value: datetime) -> str:
+    encouragement = random.choice(DRINK_ENCOURAGEMENT_MESSAGES)
+    return f"{encouragement}\nLast drink: {format_singapore(value)}."
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
@@ -355,8 +376,10 @@ async def awake_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         user.telegram_user_id, utcnow(), config.max_awake_hours
     )
     if started:
-        await reminders.tick()
         text = "Your day has started. I’ll remind you to drink water every hour."
+        await update.effective_message.reply_text(text, reply_markup=main_keyboard())
+        await reminders.tick()
+        return
     else:
         text = "Your reminders are already running."
     await update.effective_message.reply_text(text, reply_markup=main_keyboard())
@@ -501,14 +524,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
     if data.startswith("drink:"):
+        drank_at = utcnow()
         changed = await repository.confirm_drink(
-            user.telegram_user_id, data.removeprefix("drink:"), utcnow()
+            user.telegram_user_id, data.removeprefix("drink:"), drank_at
         )
         if changed:
             await query.answer()
-            await query.edit_message_text(
-                f"Nice work! Last drink: {format_singapore(utcnow())}."
-            )
+            await query.edit_message_text(drink_confirmation_message(drank_at))
         else:
             await query.answer(
                 "This reminder was already handled or is no longer yours.",
