@@ -1,92 +1,194 @@
 # WaterChugger Telegram Bot
 
-WaterChugger is a privacy-first Telegram bot that reminds people to drink water once per hour while they are awake. It runs entirely in memory: there is no database, allowlist, password system, user history, analytics, or persistent tracking.
+WaterChugger is a Python Telegram bot that sends hourly water reminders while a user is awake. It stores a minimal PostgreSQL profile keyed by the user's numeric Telegram ID so onboarding and active schedules survive restarts.
 
-The bot retains a name, timezone, active reminder schedule, and handled reminder IDs only while the process is running. A restart or Railway redeployment clears everything.
+Only the latest confirmed drink time is retained. The bot does not store message contents, phone numbers, Telegram usernames, raw location coordinates, or historical drink events. A complete user row is automatically deleted after 24 hours without user interaction.
 
-This is a general wellness reminder, not medical advice. Hydration needs vary; anyone with a prescribed fluid restriction should follow their clinician's advice.
+This is a general wellness reminder, not medical advice. Anyone with a prescribed fluid restriction should follow their clinician's advice.
 
-## Features
+## What is stored
 
-- Available to anyone through a private Telegram chat
-- Asks for a preferred name and timezone
-- Determines timezone from a shared location without retaining the coordinates
-- Sends an immediate reminder after `/awake`, then one every 60 minutes
-- **Drank it**, **Snooze 15 min**, and **Going to sleep** buttons
-- Stops reminders with `/sleep` or automatically after 18 hours
-- Stores no hydration totals or history
-- Clears all temporary user state on restart
-- Ready for single-replica Railway deployment
+Each user row contains an increasing internal database ID, Telegram numeric user ID, private chat ID, entered name, timezone, onboarding state, last activity time, latest drink time, and active reminder schedule. Timestamps are stored as timezone-aware instants and displayed in Singapore time.
 
-## Local setup
+Any command, message, location share, or button press updates `last_activity_at`. Bot-generated reminders do not count as user activity. After 24 hours without input, the row and schedule are deleted and `/start` onboarding is required again.
 
-Python 3.12 is recommended.
+## Requirements
+
+- Docker Desktop or another Docker Engine with Docker Compose
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+
+Python and PostgreSQL do not need to be installed on the host.
+
+## Start locally with Docker
+
+Create the local environment file:
 
 ```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Create a bot through [@BotFather](https://t.me/BotFather), then put its token in `.env`:
+Edit `.env` and replace the Telegram token placeholder:
 
 ```dotenv
-TELEGRAM_BOT_TOKEN=replace_with_your_bot_token
+TELEGRAM_BOT_TOKEN=your_real_botfather_token
+
+POSTGRES_USER=waterchugger
+POSTGRES_PASSWORD=localpassword
+POSTGRES_DB=waterchugger
+
 REMINDER_INTERVAL_MINUTES=60
 SNOOZE_MINUTES=15
 MAX_AWAKE_HOURS=18
+IDLE_EXPIRY_HOURS=24
+CLEANUP_INTERVAL_SECONDS=300
 SCHEDULER_INTERVAL_SECONDS=15
 LOG_LEVEL=INFO
 ```
 
-Start the bot:
+Build and start Python and PostgreSQL together:
 
 ```bash
-python main.py
+docker compose up --build
 ```
+
+The Compose service automatically supplies this internal connection URL to the bot:
+
+```text
+postgresql+asyncpg://waterchugger:localpassword@db:5432/waterchugger
+```
+
+The `db` hostname works inside Docker. If connecting from a host application instead, use `localhost`, but the supported development workflow runs Python inside Docker.
+
+Useful commands:
+
+```bash
+docker compose logs -f bot
+docker compose down
+docker compose up --build
+```
+
+`docker compose down` retains the named PostgreSQL volume. The following command is destructive and permanently deletes the local database:
+
+```bash
+docker compose down -v
+```
+
+## Run tests in Docker
+
+The test service starts a separate temporary PostgreSQL 16 database, applies migrations, and runs the suite:
+
+```bash
+docker compose run --rm test
+```
+
+The test database does not use the development database volume.
 
 ## Commands
 
-- `/start` — enter a temporary name and timezone
+- `/start` — create or resume onboarding
 - `/awake` — start hourly reminders
 - `/sleep` — stop reminders
-- `/status` — show whether reminders are active and the next reminder time
-- `/settings` — show temporary settings
-- `/name New Name` — change the temporary preferred name
-- `/timezone Asia/Singapore` — change the temporary IANA timezone
-- `/forget_me` — immediately clear the user's temporary state
+- `/status` — show the schedule and latest drink time in Singapore time
+- `/settings` — show the database ID and saved settings
+- `/name New Name` — change the saved name
+- `/timezone Asia/Singapore` — change the saved IANA timezone
+- `/forget_me` — immediately delete the profile and schedule
 - `/cancel` — cancel the current input step
 - `/help` — show command help
 
-Tapping **Drank it** only dismisses that reminder. The acknowledgement is not counted or added to any history. **Snooze 15 min** moves the next reminder to 15 minutes later; the following hourly interval starts from that snoozed delivery.
+**Drank it** records only the latest confirmation timestamp. **Snooze 15 min** persists the delayed reminder. Active schedules resume after restarts and deployments.
 
-## Deploy to Railway
+## Inspect the local database
 
-1. Push the project to GitHub and create a Railway project from the repository.
-2. Do not add PostgreSQL or any other database service.
-3. Add the variables from `.env.example` to the service's **Variables** tab.
-4. Set the real `TELEGRAM_BOT_TOKEN` value.
-5. Deploy. `railway.toml` runs `python main.py`.
-6. Keep exactly one replica because Telegram long polling cannot use multiple instances with the same bot token.
-
-When Railway restarts or redeploys the service, every user must run `/start` and `/awake` again. This is intentional for the first iteration and ensures that no user profiles or drinking habits are retained.
-
-## Tests
+Open a PostgreSQL shell inside the database container:
 
 ```bash
-pip install -r requirements-dev.txt
-pytest
+docker compose exec db psql -U waterchugger -d waterchugger
 ```
 
-Suggested deployment smoke test:
+Useful read-only queries:
 
-1. Complete `/start` and confirm `/settings` says storage is memory-only.
-2. Send `/awake` and check that an immediate reminder arrives.
-3. Test **Drank it** and confirm no count is shown.
-4. Test **Snooze 15 min**, then `/sleep`.
-5. Restart the Railway service and confirm `/status` requires onboarding again.
+```sql
+SELECT id, telegram_user_id, name, is_awake,
+       last_activity_at AT TIME ZONE 'Asia/Singapore' AS last_activity_sgt,
+       last_drank_at AT TIME ZONE 'Asia/Singapore' AS last_drank_sgt
+FROM users
+ORDER BY id;
+```
 
-## Data handling
+Exit with `\q`.
 
-There are no database or filesystem writes for user data. Temporary state is held in the Python process so the bot can address the user, calculate the next reminder, prevent duplicate button handling, and stop the current session. Shared coordinates are used only to calculate an IANA timezone and are discarded immediately. Telegram itself still processes and retains messages according to Telegram's own policies.
+## Database migrations
+
+Alembic migrations run automatically before the bot starts in Docker Compose and before Railway deploys the new version.
+
+To run them manually inside the bot image:
+
+```bash
+docker compose run --rm bot alembic upgrade head
+```
+
+Running `alembic upgrade head` repeatedly is safe; already-applied migrations are not rerun.
+
+## Upgrade the existing Railway deployment
+
+Use the existing Railway project and existing bot service. Do not create a
+second bot service with the same Telegram token.
+
+1. Commit these changes and push them to the GitHub branch already connected
+   to the Railway bot service.
+2. Open the existing Railway project. From its project canvas, select **+ New**
+   and add a **PostgreSQL** database service.
+3. Open the existing bot service's **Variables** tab. Keep its current
+   `TELEGRAM_BOT_TOKEN`, add the PostgreSQL reference, and add or update the
+   timing variables:
+
+```dotenv
+TELEGRAM_BOT_TOKEN=your_real_botfather_token
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+REMINDER_INTERVAL_MINUTES=60
+SNOOZE_MINUTES=15
+MAX_AWAKE_HOURS=18
+IDLE_EXPIRY_HOURS=24
+CLEANUP_INTERVAL_SECONDS=300
+SCHEDULER_INTERVAL_SECONDS=15
+LOG_LEVEL=INFO
+```
+
+If the database service is not named `Postgres`, replace `Postgres` in
+`${{Postgres.DATABASE_URL}}` with the exact Railway service name. The bot does
+not need a public database URL or database port.
+
+4. Deploy the existing bot service. A push to its connected GitHub branch will
+   normally trigger this automatically; otherwise choose **Redeploy** from the
+   bot service.
+5. Confirm the bot service has exactly one replica and stop any local copy using
+   the same Telegram token.
+
+Railway uses the repository `Dockerfile`. The pre-deploy command in `railway.toml` runs `alembic upgrade head`, and the image starts with `python main.py`.
+
+Keep exactly one bot replica. Telegram long polling must not run from multiple instances with the same token.
+
+### One-time effect on current users
+
+The previous release stored users and schedules only in the Python process's
+memory. That memory cannot be copied into PostgreSQL during deployment. When
+this upgrade restarts the bot, existing users keep the same Telegram bot chat
+but must send `/start` and complete their name and timezone once more. Existing
+hourly schedules will not resume until they do so and send `/awake`.
+
+After that one-time onboarding, profiles and active schedules survive normal
+Railway deployments because they are stored in PostgreSQL. A user must onboard
+again only after `/forget_me`, database loss, or 24 hours without interacting
+with the bot.
+
+## Railway verification
+
+1. Check the existing bot service's deployment logs for a successful Alembic
+   migration and bot startup.
+2. Complete `/start`, send `/awake`, and confirm a reminder.
+3. Check `/status` for the latest drink timestamp.
+4. Redeploy and verify that the active schedule remains available.
+5. Use `/forget_me` and confirm `/status` requires `/start` again.
+
+For a quick expiry test in a non-production environment, temporarily reduce `IDLE_EXPIRY_HOURS`, wait for the cleanup job, and confirm that the row is removed. Restore it to `24` afterward.

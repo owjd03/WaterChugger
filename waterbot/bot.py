@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import (
@@ -27,10 +27,12 @@ from telegram.ext import (
 from timezonefinder import TimezoneFinder
 
 from waterbot.config import Config, ConfigError
-from waterbot.state import GuestSession, Profile, RuntimeState, Step
+from waterbot.models import User
+from waterbot.repository import UserRepository
 
 LOGGER = logging.getLogger(__name__)
 TIMEZONE_FINDER = TimezoneFinder(in_memory=True)
+SINGAPORE = ZoneInfo("Asia/Singapore")
 
 AWAKE_TEXT = "☀️ I'm awake"
 SLEEP_TEXT = "😴 I'm going to sleep"
@@ -38,6 +40,12 @@ SLEEP_TEXT = "😴 I'm going to sleep"
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def format_singapore(value: datetime | None) -> str:
+    if value is None:
+        return "Never"
+    return value.astimezone(SINGAPORE).strftime("%d %b %Y, %H:%M SGT")
 
 
 def main_keyboard() -> ReplyKeyboardMarkup:
@@ -56,14 +64,14 @@ def location_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def reminder_keyboard(reminder_id: str, snooze_minutes: int) -> InlineKeyboardMarkup:
+def reminder_keyboard(token: str, snooze_minutes: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("💧 Drank it", callback_data=f"drink:{reminder_id}"),
+                InlineKeyboardButton("💧 Drank it", callback_data=f"drink:{token}"),
                 InlineKeyboardButton(
                     f"⏰ Snooze {snooze_minutes} min",
-                    callback_data=f"snooze:{reminder_id}",
+                    callback_data=f"snooze:{token}",
                 ),
             ],
             [InlineKeyboardButton("😴 Going to sleep", callback_data="sleep")],
@@ -88,67 +96,67 @@ def validate_timezone(raw: str) -> str | None:
 
 
 class ReminderService:
-    def __init__(self, application: Application, config: Config, state: RuntimeState) -> None:
+    def __init__(
+        self, application: Application, config: Config, repository: UserRepository
+    ) -> None:
         self.application = application
         self.config = config
-        self.state = state
+        self.repository = repository
 
-    async def start_day(self, user_id: int) -> str:
-        current = self.state.guest_sessions.get(user_id)
-        if current and current.active:
-            return "Your reminders are already running."
-        self.state.guest_sessions[user_id] = GuestSession.start(
-            utcnow(), self.config.max_awake_hours
-        )
-        await self.tick()
-        return "Your day has started. I’ll remind you to drink water every hour."
-
-    def stop_day(self, user_id: int) -> bool:
-        session = self.state.guest_sessions.get(user_id)
-        return bool(session and session.stop())
+    @property
+    def idle_threshold(self) -> datetime:
+        return utcnow() - timedelta(hours=self.config.idle_expiry_hours)
 
     async def tick(self, _context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
         now = utcnow()
-        for user_id, session in list(self.state.guest_sessions.items()):
-            if now >= session.stop_at:
-                session.active = False
-            reminder = session.claim_due(now, self.config.reminder_interval_minutes)
-            if reminder is None:
-                continue
-            profile = self.state.profiles.get(user_id)
-            if profile is None:
-                session.active = False
-                continue
+        await self.repository.expire_sessions(now)
+        reminders = await self.repository.claim_due(
+            now,
+            self.config.reminder_interval_minutes,
+            now - timedelta(hours=self.config.idle_expiry_hours),
+        )
+        for reminder in reminders:
             try:
                 await self.application.bot.send_message(
-                    chat_id=profile.chat_id,
-                    text=f"💧 <b>{html.escape(profile.name or 'Friend')}</b>, it’s time to drink some water.",
+                    chat_id=reminder.chat_id,
+                    text=(
+                        f"💧 <b>{html.escape(reminder.name)}</b>, "
+                        "it’s time to drink some water."
+                    ),
                     parse_mode=ParseMode.HTML,
-                    reply_markup=reminder_keyboard(reminder.id, self.config.snooze_minutes),
+                    reply_markup=reminder_keyboard(
+                        reminder.token, self.config.snooze_minutes
+                    ),
                 )
             except Exception:
-                LOGGER.exception("Could not deliver reminder to Telegram user %s", user_id)
+                LOGGER.exception(
+                    "Could not deliver reminder to Telegram user %s",
+                    reminder.telegram_user_id,
+                )
+                await self.repository.retry_delivery(
+                    reminder.user_id,
+                    reminder.token,
+                    utcnow() + timedelta(minutes=1),
+                )
 
-    def confirm(self, user_id: int, reminder_id: str) -> bool:
-        session = self.state.guest_sessions.get(user_id)
-        return bool(session and session.confirm(reminder_id))
-
-    def snooze(self, user_id: int, reminder_id: str) -> bool:
-        session = self.state.guest_sessions.get(user_id)
-        return bool(
-            session
-            and session.snooze(
-                reminder_id, utcnow(), self.config.snooze_minutes
-            )
-        )
+    async def cleanup(self, _context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
+        deleted = await self.repository.delete_expired(self.idle_threshold)
+        if deleted:
+            LOGGER.info("Deleted %s user row(s) after inactivity", deleted)
 
 
-def components(context: ContextTypes.DEFAULT_TYPE) -> tuple[Config, RuntimeState, ReminderService]:
+def components(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> tuple[Config, UserRepository, ReminderService]:
     return (
         context.application.bot_data["config"],
-        context.application.bot_data["state"],
+        context.application.bot_data["repository"],
         context.application.bot_data["reminders"],
     )
+
+
+def idle_threshold(config: Config, now: datetime) -> datetime:
+    return now - timedelta(hours=config.idle_expiry_hours)
 
 
 async def private_only(update: Update) -> bool:
@@ -160,36 +168,80 @@ async def private_only(update: Update) -> bool:
     return False
 
 
+async def touch_user(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> User | None:
+    if not update.effective_user or not update.effective_chat:
+        return None
+    config, repository, _ = components(context)
+    now = utcnow()
+    return await repository.touch(
+        update.effective_user.id,
+        update.effective_chat.id,
+        now,
+        idle_threshold(config, now),
+    )
+
+
+async def require_user(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> User | None:
+    user = await touch_user(update, context)
+    if user is None and update.effective_message:
+        await update.effective_message.reply_text(
+            "Your session is missing or expired. Send /start to set up again.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    return user
+
+
+async def ask_for_timezone(update: Update, name: str) -> None:
+    await update.effective_message.reply_text(
+        f"Nice to meet you, {name}. Share your location so I can determine your timezone. "
+        "The coordinates are not saved. If location sharing does not work, send:\n\n"
+        "/timezone Asia/Singapore",
+        reply_markup=location_keyboard(),
+    )
+
+
+async def finish_onboarding(update: Update, user: User) -> None:
+    await update.effective_message.reply_text(
+        f"All set, {user.name}! Use /awake when you wake up. Your profile and active "
+        "reminders will survive restarts, but your profile is deleted after 24 hours "
+        "without interaction.\n\nThis is a general wellness reminder, not medical advice.",
+        reply_markup=main_keyboard(),
+    )
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await private_only(update) or not update.effective_user or not update.effective_chat:
         return
-    _, state, _ = components(context)
-    profile = state.profile(update.effective_user.id, update.effective_chat.id)
-    if profile.complete:
+    config, repository, _ = components(context)
+    now = utcnow()
+    user, created = await repository.create_or_touch(
+        update.effective_user.id,
+        update.effective_chat.id,
+        now,
+        idle_threshold(config, now),
+    )
+    if not created and user.name and user.onboarding_step == "none":
         await update.effective_message.reply_text(
-            f"Welcome back, {profile.name}! Use /awake when your day starts.",
+            f"Welcome back, {user.name}! Use /awake when your day starts.",
             reply_markup=main_keyboard(),
         )
         return
-    profile.step = Step.NAME
+    if user.name and user.onboarding_step == "timezone":
+        await ask_for_timezone(update, user.name)
+        return
+    await repository.set_onboarding_step(user.telegram_user_id, "name", now)
     await update.effective_message.reply_text(
         "Hi! What name should I use when reminding you?",
         reply_markup=ReplyKeyboardRemove(),
     )
 
 
-async def finish_onboarding(update: Update, profile: Profile) -> None:
-    profile.step = Step.NONE
-    await update.effective_message.reply_text(
-        f"All set, {profile.name}! Use /awake when you wake up. Your details and reminder "
-        "session exist only in memory and disappear whenever the bot restarts.\n\n"
-        "This is a general wellness reminder, not medical advice.",
-        reply_markup=main_keyboard(),
-    )
-
-
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await private_only(update) or not update.effective_user or not update.effective_chat:
+    if not await private_only(update) or not update.effective_user:
         return
     text = update.effective_message.text or ""
     if text == AWAKE_TEXT:
@@ -199,32 +251,25 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await sleep_command(update, context)
         return
 
-    _, state, _ = components(context)
-    profile = state.profile(update.effective_user.id, update.effective_chat.id)
-    if profile.step in (Step.NAME, Step.NAME_UPDATE):
+    user = await require_user(update, context)
+    if user is None:
+        return
+    _, repository, _ = components(context)
+    if user.onboarding_step in ("name", "name_update"):
         name = validate_name(text)
         if not name:
             await update.effective_message.reply_text(
                 "Please enter a printable name from 1–50 characters."
             )
             return
-        updating = profile.step == Step.NAME_UPDATE
-        profile.name = name
-        if updating and profile.timezone:
-            profile.step = Step.NONE
+        updated = await repository.set_name(user.telegram_user_id, name, utcnow())
+        if updated and updated.onboarding_step == "none":
             await update.effective_message.reply_text(
                 f"I’ll call you {name}.", reply_markup=main_keyboard()
             )
-            return
-        profile.step = Step.TIMEZONE
-        await update.effective_message.reply_text(
-            f"Nice to meet you, {name}. Share your location so I can determine your timezone. "
-            "The coordinates are not saved. If location sharing does not work, send:\n\n"
-            "/timezone Asia/Singapore",
-            reply_markup=location_keyboard(),
-        )
+        else:
+            await ask_for_timezone(update, name)
         return
-
     await update.effective_message.reply_text(
         "I didn’t understand that. Use /help to see the available commands.",
         reply_markup=main_keyboard(),
@@ -232,10 +277,11 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def location_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await private_only(update) or not update.effective_user or not update.effective_chat:
+    if not await private_only(update) or not update.effective_user:
         return
-    _, state, _ = components(context)
-    profile = state.profile(update.effective_user.id, update.effective_chat.id)
+    user = await require_user(update, context)
+    if user is None:
+        return
     location = update.effective_message.location
     timezone_name = TIMEZONE_FINDER.timezone_at(
         lat=location.latitude, lng=location.longitude
@@ -245,22 +291,34 @@ async def location_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "I couldn’t determine that timezone. Send:\n\n/timezone Asia/Singapore"
         )
         return
-    profile.timezone = timezone_name
-    if profile.name:
-        await finish_onboarding(update, profile)
-    else:
+    was_update = user.onboarding_step == "timezone_update"
+    _, repository, _ = components(context)
+    updated = await repository.set_timezone(user.telegram_user_id, timezone_name, utcnow())
+    if updated and updated.name and was_update:
         await update.effective_message.reply_text(
             f"Timezone updated to {timezone_name}.", reply_markup=main_keyboard()
         )
+    elif updated and updated.name:
+        await finish_onboarding(update, updated)
+    else:
+        await repository.set_onboarding_step(user.telegram_user_id, "name", utcnow())
+        await update.effective_message.reply_text("What name should I use when reminding you?")
 
 
 async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await private_only(update) or not update.effective_user or not update.effective_chat:
+    if not await private_only(update) or not update.effective_user:
         return
-    _, state, _ = components(context)
-    profile = state.profile(update.effective_user.id, update.effective_chat.id)
+    user = await require_user(update, context)
+    if user is None:
+        return
+    _, repository, _ = components(context)
     if not context.args:
-        profile.step = Step.TIMEZONE
+        step = (
+            "timezone_update"
+            if user.name and user.onboarding_step == "none"
+            else "timezone"
+        )
+        await repository.set_onboarding_step(user.telegram_user_id, step, utcnow())
         await update.effective_message.reply_text(
             "Send your timezone like this:\n\n/timezone Asia/Singapore\n\n"
             "Or use the button to share your location.",
@@ -273,33 +331,45 @@ async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "That timezone is invalid. Try an IANA name such as Asia/Singapore."
         )
         return
-    profile.timezone = timezone_name
-    if profile.name and profile.step == Step.TIMEZONE:
-        await finish_onboarding(update, profile)
-    else:
-        profile.step = Step.NONE
+    was_update = user.onboarding_step in ("none", "timezone_update")
+    updated = await repository.set_timezone(user.telegram_user_id, timezone_name, utcnow())
+    if updated and updated.name and was_update:
         await update.effective_message.reply_text(
             f"Timezone updated to {timezone_name}.", reply_markup=main_keyboard()
         )
+    elif updated and updated.name:
+        await finish_onboarding(update, updated)
 
 
 async def awake_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await private_only(update) or not update.effective_user or not update.effective_chat:
+    if not await private_only(update) or not update.effective_user:
         return
-    _, state, reminders = components(context)
-    profile = state.profile(update.effective_user.id, update.effective_chat.id)
-    if not profile.complete:
+    user = await require_user(update, context)
+    if user is None:
+        return
+    if not user.name or user.onboarding_step != "none":
         await update.effective_message.reply_text("Please complete /start first.")
         return
-    result = await reminders.start_day(profile.user_id)
-    await update.effective_message.reply_text(result, reply_markup=main_keyboard())
+    config, repository, reminders = components(context)
+    _, started = await repository.start_day(
+        user.telegram_user_id, utcnow(), config.max_awake_hours
+    )
+    if started:
+        await reminders.tick()
+        text = "Your day has started. I’ll remind you to drink water every hour."
+    else:
+        text = "Your reminders are already running."
+    await update.effective_message.reply_text(text, reply_markup=main_keyboard())
 
 
 async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await private_only(update) or not update.effective_user:
         return
-    _, _, reminders = components(context)
-    stopped = reminders.stop_day(update.effective_user.id)
+    user = await require_user(update, context)
+    if user is None:
+        return
+    _, repository, _ = components(context)
+    stopped = await repository.stop_day(user.telegram_user_id, utcnow())
     await update.effective_message.reply_text(
         "Sleep well! Water reminders are stopped."
         if stopped
@@ -309,48 +379,45 @@ async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await private_only(update) or not update.effective_user:
+    if not await private_only(update):
         return
-    _, state, _ = components(context)
-    profile = state.profiles.get(update.effective_user.id)
-    session = state.guest_sessions.get(update.effective_user.id)
-    if not profile or not profile.complete:
-        await update.effective_message.reply_text("Complete /start first.")
+    user = await require_user(update, context)
+    if user is None:
         return
-    if not session or not session.active:
-        await update.effective_message.reply_text(
-            "Reminders are stopped. No hydration history is recorded."
-        )
-        return
-    next_due = session.next_due_at.astimezone(ZoneInfo(profile.timezone or "UTC"))
-    await update.effective_message.reply_text(
-        f"Reminders are running. Next reminder: {next_due.strftime('%H:%M %Z')}.\n"
-        "No hydration history is recorded."
-    )
+    status = "running" if user.is_awake else "stopped"
+    lines = [
+        f"Reminders: {status}",
+        f"Last drink: {format_singapore(user.last_drank_at)}",
+        f"Last activity: {format_singapore(user.last_activity_at)}",
+    ]
+    if user.is_awake and user.next_reminder_at:
+        lines.insert(1, f"Next reminder: {format_singapore(user.next_reminder_at)}")
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await private_only(update) or not update.effective_user:
+    if not await private_only(update):
         return
-    config, state, _ = components(context)
-    profile = state.profiles.get(update.effective_user.id)
-    if not profile or not profile.complete:
-        await update.effective_message.reply_text("Complete /start first.")
+    user = await require_user(update, context)
+    if user is None:
         return
+    config, _, _ = components(context)
     await update.effective_message.reply_text(
-        f"Name: {profile.name}\nTimezone: {profile.timezone}\n"
+        f"Database ID: {user.id}\nName: {user.name}\nTimezone: {user.timezone}\n"
         f"Interval: {config.reminder_interval_minutes} minutes\n"
         f"Snooze: {config.snooze_minutes} minutes\n"
-        "Storage: memory only; nothing is retained after a restart.\n\n"
+        f"Inactive profiles are deleted after {config.idle_expiry_hours} hours.\n\n"
         "Change your details with /name New Name or /timezone Area/City."
     )
 
 
 async def name_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await private_only(update) or not update.effective_user or not update.effective_chat:
+    if not await private_only(update) or not update.effective_user:
         return
-    _, state, _ = components(context)
-    profile = state.profile(update.effective_user.id, update.effective_chat.id)
+    user = await require_user(update, context)
+    if user is None:
+        return
+    _, repository, _ = components(context)
     if context.args:
         name = validate_name(" ".join(context.args))
         if not name:
@@ -358,47 +425,54 @@ async def name_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "Please use a printable name from 1–50 characters."
             )
             return
-        profile.name = name
+        await repository.set_onboarding_step(user.telegram_user_id, "name_update", utcnow())
+        await repository.set_name(user.telegram_user_id, name, utcnow())
         await update.effective_message.reply_text(f"I’ll call you {name}.")
     else:
-        profile.step = Step.NAME_UPDATE
+        await repository.set_onboarding_step(user.telegram_user_id, "name_update", utcnow())
         await update.effective_message.reply_text("What name should I use?")
 
 
 async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await private_only(update) or not update.effective_user:
         return
-    _, state, _ = components(context)
-    user_id = update.effective_user.id
-    state.guest_sessions.pop(user_id, None)
-    state.profiles.pop(user_id, None)
+    _, repository, _ = components(context)
+    deleted = await repository.delete_user(update.effective_user.id)
     await update.effective_message.reply_text(
-        "Your temporary name, timezone, and reminder session have been cleared. Use /start to begin again.",
+        "Your saved profile and reminder schedule were deleted. Use /start to begin again."
+        if deleted
+        else "No saved profile was found.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await private_only(update) or not update.effective_user or not update.effective_chat:
+    if not await private_only(update) or not update.effective_user:
         return
-    _, state, _ = components(context)
-    state.profile(update.effective_user.id, update.effective_chat.id).step = Step.NONE
-    await update.effective_message.reply_text(
-        "Cancelled.", reply_markup=main_keyboard()
-    )
+    user = await require_user(update, context)
+    if user is None:
+        return
+    _, repository, _ = components(context)
+    if user.onboarding_step in ("name_update", "timezone_update"):
+        next_step = "none"
+    else:
+        next_step = "timezone" if user.name else "name"
+    await repository.set_onboarding_step(user.telegram_user_id, next_step, utcnow())
+    await update.effective_message.reply_text("Cancelled.", reply_markup=main_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await private_only(update):
         return
+    await touch_user(update, context)
     await update.effective_message.reply_text(
         "/start – set up the bot\n/awake – start hourly reminders\n"
-        "/sleep – stop reminders\n/status – show the current reminder state\n"
-        "/settings – view temporary settings\n/name – change your name\n"
-        "/timezone – change timezone\n/forget_me – clear temporary state\n"
+        "/sleep – stop reminders\n/status – show reminder and drink status\n"
+        "/settings – view saved settings\n/name – change your name\n"
+        "/timezone – change timezone\n/forget_me – delete your saved profile\n"
         "/cancel – cancel input\n/help – show this help\n\n"
-        "The bot does not maintain hydration history or persistent user records. "
-        "Hydration needs vary; follow medical advice if you have a fluid restriction."
+        "Only your latest drink time is retained. Hydration needs vary; follow medical "
+        "advice if you have a fluid restriction."
     )
 
 
@@ -411,11 +485,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         or update.effective_chat.type != ChatType.PRIVATE
     ):
         return
-    config, _, reminders = components(context)
+    user = await touch_user(update, context)
+    if user is None:
+        await query.answer("Your session expired. Send /start again.", show_alert=True)
+        return
+    config, repository, _ = components(context)
     data = query.data or ""
     if data == "sleep":
+        stopped = await repository.stop_day(user.telegram_user_id, utcnow())
         await query.answer()
-        stopped = reminders.stop_day(update.effective_user.id)
         await query.edit_message_text(
             "Sleep well! Reminders are stopped."
             if stopped
@@ -423,13 +501,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
     if data.startswith("drink:"):
-        changed = reminders.confirm(
-            update.effective_user.id, data.removeprefix("drink:")
+        changed = await repository.confirm_drink(
+            user.telegram_user_id, data.removeprefix("drink:"), utcnow()
         )
         if changed:
             await query.answer()
             await query.edit_message_text(
-                "Nice work! This acknowledgement is not added to any history."
+                f"Nice work! Last drink: {format_singapore(utcnow())}."
             )
         else:
             await query.answer(
@@ -438,8 +516,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
         return
     if data.startswith("snooze:"):
-        changed = reminders.snooze(
-            update.effective_user.id, data.removeprefix("snooze:")
+        changed = await repository.snooze(
+            user.telegram_user_id,
+            data.removeprefix("snooze:"),
+            utcnow(),
+            config.snooze_minutes,
         )
         if changed:
             await query.answer()
@@ -460,15 +541,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def post_init(application: Application) -> None:
     config: Config = application.bot_data["config"]
+    repository: UserRepository = application.bot_data["repository"]
     reminders: ReminderService = application.bot_data["reminders"]
+    await repository.ping()
     await application.bot.set_my_commands(
         [
             BotCommand("start", "Set up the bot"),
             BotCommand("awake", "Start hourly reminders"),
             BotCommand("sleep", "Stop reminders"),
-            BotCommand("status", "Show reminder status"),
-            BotCommand("settings", "View temporary settings"),
-            BotCommand("forget_me", "Clear temporary state"),
+            BotCommand("status", "Show reminder and drink status"),
+            BotCommand("settings", "View saved settings"),
+            BotCommand("forget_me", "Delete saved profile"),
             BotCommand("help", "Show help"),
         ]
     )
@@ -478,16 +561,33 @@ async def post_init(application: Application) -> None:
         first=1,
         name="reminder-scheduler",
     )
+    application.job_queue.run_repeating(
+        reminders.cleanup,
+        interval=config.cleanup_interval_seconds,
+        first=5,
+        name="expired-user-cleanup",
+    )
+
+
+async def post_shutdown(application: Application) -> None:
+    repository: UserRepository = application.bot_data["repository"]
+    await repository.close()
 
 
 def build_application(config: Config) -> Application:
     application = (
-        ApplicationBuilder().token(config.telegram_token).post_init(post_init).build()
+        ApplicationBuilder()
+        .token(config.telegram_token)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
     )
-    state = RuntimeState()
+    repository = UserRepository(config.database_url)
     application.bot_data["config"] = config
-    application.bot_data["state"] = state
-    application.bot_data["reminders"] = ReminderService(application, config, state)
+    application.bot_data["repository"] = repository
+    application.bot_data["reminders"] = ReminderService(
+        application, config, repository
+    )
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("awake", awake_command))
