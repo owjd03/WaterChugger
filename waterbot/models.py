@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Identity, Index, String, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    Identity,
+    Index,
+    String,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -15,6 +24,10 @@ class User(Base):
     __table_args__ = (
         Index("ix_users_last_activity_at", "last_activity_at"),
         Index("ix_users_due_reminders", "is_awake", "next_reminder_at"),
+        CheckConstraint(
+            "NOT is_working_out OR is_awake",
+            name="ck_users_workout_requires_awake",
+        ),
     )
 
     id: Mapped[int] = mapped_column(
@@ -40,6 +53,9 @@ class User(Base):
     is_awake: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("false")
     )
+    is_working_out: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
     session_started_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True)
     )
@@ -50,4 +66,3 @@ class User(Base):
         DateTime(timezone=True)
     )
     current_reminder_token: Mapped[str | None] = mapped_column(String(36))
-

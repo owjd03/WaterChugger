@@ -27,6 +27,7 @@ class Config:
     telegram_token: str
     database_url: str
     reminder_interval_minutes: int = 60
+    workout_reminder_interval_minutes: int = 15
     snooze_minutes: int = 15
     max_awake_hours: int = 18
     idle_expiry_hours: int = 24
@@ -53,6 +54,9 @@ class Config:
             telegram_token=token,
             database_url=database_url,
             reminder_interval_minutes=_positive_int("REMINDER_INTERVAL_MINUTES", 60),
+            workout_reminder_interval_minutes=_positive_int(
+                "WORKOUT_REMINDER_INTERVAL_MINUTES", 15
+            ),
             snooze_minutes=_positive_int("SNOOZE_MINUTES", 15),
             max_awake_hours=_positive_int("MAX_AWAKE_HOURS", 18),
             idle_expiry_hours=_positive_int("IDLE_EXPIRY_HOURS", 24),

@@ -54,7 +54,7 @@ async def test_onboarding_and_schedule_recovery_fields() -> None:
     user, started = await repository.start_day(1001, NOW, 18)
     assert started is True
     assert user and user.next_reminder_at == NOW
-    due = await repository.claim_due(NOW, 60, NOW - timedelta(hours=24))
+    due = await repository.claim_due(NOW, 60, 15, NOW - timedelta(hours=24))
     assert len(due) == 1
     saved = await repository.get(1001)
     assert saved and saved.current_reminder_token == due[0].token
@@ -69,11 +69,14 @@ async def test_drink_confirmation_is_idempotent_and_singapore_safe() -> None:
     await repository.set_name(1001, "Ada", NOW)
     await repository.set_timezone(1001, "Asia/Singapore", NOW)
     await repository.start_day(1001, NOW, 18)
-    reminder = (await repository.claim_due(NOW, 60, NOW - timedelta(hours=24)))[0]
+    reminder = (
+        await repository.claim_due(NOW, 60, 15, NOW - timedelta(hours=24))
+    )[0]
 
     drank_at = NOW + timedelta(minutes=2)
-    assert await repository.confirm_drink(1001, reminder.token, drank_at) is True
-    assert await repository.confirm_drink(1001, reminder.token, drank_at) is False
+    confirmation = await repository.confirm_drink(1001, reminder.token, drank_at)
+    assert confirmation and confirmation.is_working_out is False
+    assert await repository.confirm_drink(1001, reminder.token, drank_at) is None
     saved = await repository.get(1001)
     assert saved and saved.last_drank_at == drank_at
     await repository.close()
@@ -89,12 +92,84 @@ async def test_snooze_and_wrong_user_token() -> None:
         await repository.set_name(telegram_id, f"User {telegram_id}", NOW)
         await repository.set_timezone(telegram_id, "Asia/Singapore", NOW)
         await repository.start_day(telegram_id, NOW, 18)
-    reminders = await repository.claim_due(NOW, 60, NOW - timedelta(hours=24))
+    reminders = await repository.claim_due(
+        NOW, 60, 15, NOW - timedelta(hours=24)
+    )
     first = next(item for item in reminders if item.telegram_user_id == 1001)
     assert await repository.snooze(1002, first.token, NOW, 15) is False
     assert await repository.snooze(1001, first.token, NOW, 15) is True
     saved = await repository.get(1001)
     assert saved and saved.next_reminder_at == NOW + timedelta(minutes=15)
+    await repository.close()
+
+
+async def test_workout_mode_cadence_transitions_and_sleep_guard() -> None:
+    repository = UserRepository(repository_database_url())
+    await clean(repository)
+    await repository.create_or_touch(1001, 1001, NOW, NOW - timedelta(hours=24))
+    await repository.set_name(1001, "Ada", NOW)
+    await repository.set_timezone(1001, "Asia/Singapore", NOW)
+
+    assert await repository.start_workout(1001, NOW) == "not_awake"
+    await repository.start_day(1001, NOW, 18)
+    normal = (
+        await repository.claim_due(NOW, 60, 15, NOW - timedelta(hours=24))
+    )[0]
+    assert normal.is_working_out is False
+
+    workout_at = NOW + timedelta(minutes=1)
+    assert await repository.start_workout(1001, workout_at) == "started"
+    assert await repository.start_workout(1001, workout_at) == "already_working_out"
+    assert await repository.stop_day(1001, workout_at) == "working_out"
+    assert (
+        await repository.stop_day_from_reminder(1001, normal.token, workout_at)
+        == "working_out"
+    )
+
+    workout = (
+        await repository.claim_due(
+            workout_at, 60, 15, NOW - timedelta(hours=24)
+        )
+    )[0]
+    assert workout.is_working_out is True
+    saved = await repository.get(1001)
+    assert saved and saved.next_reminder_at == workout_at + timedelta(minutes=15)
+
+    drank_at = workout_at + timedelta(minutes=1)
+    confirmation = await repository.confirm_drink(1001, workout.token, drank_at)
+    assert confirmation and confirmation.is_working_out is True
+
+    end_at = workout_at + timedelta(minutes=2)
+    assert await repository.end_workout(1001, end_at) == "ended"
+    normal_again = (
+        await repository.claim_due(end_at, 60, 15, NOW - timedelta(hours=24))
+    )[0]
+    assert normal_again.is_working_out is False
+    saved = await repository.get(1001)
+    assert saved and saved.next_reminder_at == end_at + timedelta(minutes=60)
+    assert await repository.stop_day(1001, end_at) == "stopped"
+    saved = await repository.get(1001)
+    assert saved and saved.is_awake is False and saved.is_working_out is False
+    await repository.close()
+
+
+async def test_workout_callback_token_is_invalidated_by_mode_change() -> None:
+    repository = UserRepository(repository_database_url())
+    await clean(repository)
+    await repository.create_or_touch(1001, 1001, NOW, NOW - timedelta(hours=24))
+    await repository.set_name(1001, "Ada", NOW)
+    await repository.set_timezone(1001, "Asia/Singapore", NOW)
+    await repository.start_day(1001, NOW, 18)
+    await repository.start_workout(1001, NOW)
+    reminder = (
+        await repository.claim_due(NOW, 60, 15, NOW - timedelta(hours=24))
+    )[0]
+
+    assert await repository.end_workout(1002, NOW, reminder.token) is None
+    assert await repository.end_workout(1001, NOW, "wrong-token") == "stale"
+    assert await repository.end_workout(1001, NOW, reminder.token) == "ended"
+    assert await repository.end_workout(1001, NOW, reminder.token) == "not_working_out"
+    assert await repository.confirm_drink(1001, reminder.token, NOW) is None
     await repository.close()
 
 

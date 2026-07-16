@@ -28,6 +28,11 @@ from telegram.ext import (
 from timezonefinder import TimezoneFinder
 
 from waterbot.config import Config, ConfigError
+from waterbot.messages import (
+    DRINK_ENCOURAGEMENT_MESSAGES,
+    WORKOUT_DRINK_ENCOURAGEMENT_MESSAGES,
+    WORKOUT_REMINDER_MESSAGES,
+)
 from waterbot.models import User
 from waterbot.repository import UserRepository
 
@@ -37,21 +42,8 @@ SINGAPORE = ZoneInfo("Asia/Singapore")
 
 AWAKE_TEXT = "☀️ I'm awake"
 SLEEP_TEXT = "😴 I'm going to sleep"
-
-# Edit this tuple to add, remove, or rewrite the messages shown after Drank it.
-DRINK_ENCOURAGEMENT_MESSAGES = (
-    "Hydration unlocked! 💧✨",
-    "Water you waiting for? You crushed it! 🌊😄",
-    "Your kidneys just sent a thank-you note. 💌",
-    "Achievement unlocked: Sip happens! 🏆💦",
-    "Hydration station: mission complete! 🚰✅",
-    "Look at you, making your cells very happy! 🧬🎉",
-    "One small sip for you, one giant splash for hydration! 🚀💧",
-    "Keep calm and chug on! 😎🥤",
-    "Your inner houseplant is thriving! 🪴💦",
-    "Splish splash, excellent choice! 🐳✨",
-    "Lebron drinks water too nice one",
-)
+WORKOUT_TEXT = "🏋️ Pump Mode!"
+END_WORKOUT_TEXT = "🏁 End Workout"
 
 
 def utcnow() -> datetime:
@@ -64,17 +56,46 @@ def format_singapore(value: datetime | None) -> str:
     return value.astimezone(SINGAPORE).strftime("%d %b %Y, %H:%M SGT")
 
 
-def drink_confirmation_message(value: datetime) -> str:
-    encouragement = random.choice(DRINK_ENCOURAGEMENT_MESSAGES)
+def drink_confirmation_message(value: datetime, is_working_out: bool = False) -> str:
+    messages = (
+        WORKOUT_DRINK_ENCOURAGEMENT_MESSAGES
+        if is_working_out
+        else DRINK_ENCOURAGEMENT_MESSAGES
+    )
+    encouragement = random.choice(messages)
     return f"{encouragement}\nLast drink: {format_singapore(value)}."
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
+def sleeping_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(AWAKE_TEXT), KeyboardButton(SLEEP_TEXT)]],
+        [[KeyboardButton(AWAKE_TEXT)]],
         resize_keyboard=True,
         is_persistent=True,
     )
+
+
+def awake_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(WORKOUT_TEXT), KeyboardButton(SLEEP_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def workout_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(END_WORKOUT_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def state_keyboard(user: User) -> ReplyKeyboardMarkup:
+    if user.is_working_out:
+        return workout_keyboard()
+    if user.is_awake:
+        return awake_keyboard()
+    return sleeping_keyboard()
 
 
 def location_keyboard() -> ReplyKeyboardMarkup:
@@ -85,7 +106,18 @@ def location_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def reminder_keyboard(token: str, snooze_minutes: int) -> InlineKeyboardMarkup:
+def reminder_keyboard(
+    token: str, snooze_minutes: int, is_working_out: bool
+) -> InlineKeyboardMarkup:
+    mode_button = (
+        InlineKeyboardButton(
+            END_WORKOUT_TEXT, callback_data=f"end_workout:{token}"
+        )
+        if is_working_out
+        else InlineKeyboardButton(
+            "😴 Going to sleep", callback_data=f"sleep:{token}"
+        )
+    )
     return InlineKeyboardMarkup(
         [
             [
@@ -95,7 +127,7 @@ def reminder_keyboard(token: str, snooze_minutes: int) -> InlineKeyboardMarkup:
                     callback_data=f"snooze:{token}",
                 ),
             ],
-            [InlineKeyboardButton("😴 Going to sleep", callback_data="sleep")],
+            [mode_button],
         ]
     )
 
@@ -134,19 +166,27 @@ class ReminderService:
         reminders = await self.repository.claim_due(
             now,
             self.config.reminder_interval_minutes,
+            self.config.workout_reminder_interval_minutes,
             now - timedelta(hours=self.config.idle_expiry_hours),
         )
         for reminder in reminders:
             try:
-                await self.application.bot.send_message(
-                    chat_id=reminder.chat_id,
-                    text=(
+                if reminder.is_working_out:
+                    prompt = html.escape(random.choice(WORKOUT_REMINDER_MESSAGES))
+                    text = f"🏋️ <b>{html.escape(reminder.name)}</b>, {prompt}"
+                else:
+                    text = (
                         f"💧 <b>{html.escape(reminder.name)}</b>, "
                         "it’s time to drink some water."
-                    ),
+                    )
+                await self.application.bot.send_message(
+                    chat_id=reminder.chat_id,
+                    text=text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=reminder_keyboard(
-                        reminder.token, self.config.snooze_minutes
+                        reminder.token,
+                        self.config.snooze_minutes,
+                        reminder.is_working_out,
                     ),
                 )
             except Exception:
@@ -230,7 +270,7 @@ async def finish_onboarding(update: Update, user: User) -> None:
         f"All set, {user.name}! Use /awake when you wake up. Your profile and active "
         "reminders will survive restarts, but your profile is deleted after 24 hours "
         "without interaction.\n\nThis is a general wellness reminder, not medical advice.",
-        reply_markup=main_keyboard(),
+        reply_markup=state_keyboard(user),
     )
 
 
@@ -246,9 +286,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         idle_threshold(config, now),
     )
     if not created and user.name and user.onboarding_step == "none":
+        if user.is_working_out:
+            welcome = f"Welcome back, {user.name}! Pump Mode is active."
+        elif user.is_awake:
+            welcome = f"Welcome back, {user.name}! Your hourly reminders are running."
+        else:
+            welcome = f"Welcome back, {user.name}! Use /awake when your day starts."
         await update.effective_message.reply_text(
-            f"Welcome back, {user.name}! Use /awake when your day starts.",
-            reply_markup=main_keyboard(),
+            welcome,
+            reply_markup=state_keyboard(user),
         )
         return
     if user.name and user.onboarding_step == "timezone":
@@ -271,6 +317,12 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if text == SLEEP_TEXT:
         await sleep_command(update, context)
         return
+    if text == WORKOUT_TEXT:
+        await workout_command(update, context)
+        return
+    if text == END_WORKOUT_TEXT:
+        await end_workout_command(update, context)
+        return
 
     user = await require_user(update, context)
     if user is None:
@@ -286,14 +338,14 @@ async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         updated = await repository.set_name(user.telegram_user_id, name, utcnow())
         if updated and updated.onboarding_step == "none":
             await update.effective_message.reply_text(
-                f"I’ll call you {name}.", reply_markup=main_keyboard()
+                f"I’ll call you {name}.", reply_markup=state_keyboard(updated)
             )
         else:
             await ask_for_timezone(update, name)
         return
     await update.effective_message.reply_text(
         "I didn’t understand that. Use /help to see the available commands.",
-        reply_markup=main_keyboard(),
+        reply_markup=state_keyboard(user),
     )
 
 
@@ -317,7 +369,8 @@ async def location_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     updated = await repository.set_timezone(user.telegram_user_id, timezone_name, utcnow())
     if updated and updated.name and was_update:
         await update.effective_message.reply_text(
-            f"Timezone updated to {timezone_name}.", reply_markup=main_keyboard()
+            f"Timezone updated to {timezone_name}.",
+            reply_markup=state_keyboard(updated),
         )
     elif updated and updated.name:
         await finish_onboarding(update, updated)
@@ -356,7 +409,8 @@ async def timezone_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     updated = await repository.set_timezone(user.telegram_user_id, timezone_name, utcnow())
     if updated and updated.name and was_update:
         await update.effective_message.reply_text(
-            f"Timezone updated to {timezone_name}.", reply_markup=main_keyboard()
+            f"Timezone updated to {timezone_name}.",
+            reply_markup=state_keyboard(updated),
         )
     elif updated and updated.name:
         await finish_onboarding(update, updated)
@@ -377,12 +431,15 @@ async def awake_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
     if started:
         text = "Your day has started. I’ll remind you to drink water every hour."
-        await update.effective_message.reply_text(text, reply_markup=main_keyboard())
+        await update.effective_message.reply_text(text, reply_markup=awake_keyboard())
         await reminders.tick()
         return
-    else:
-        text = "Your reminders are already running."
-    await update.effective_message.reply_text(text, reply_markup=main_keyboard())
+    text = (
+        "Pump Mode is already running."
+        if user.is_working_out
+        else "Your reminders are already running."
+    )
+    await update.effective_message.reply_text(text, reply_markup=state_keyboard(user))
 
 
 async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -392,13 +449,72 @@ async def sleep_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if user is None:
         return
     _, repository, _ = components(context)
-    stopped = await repository.stop_day(user.telegram_user_id, utcnow())
-    await update.effective_message.reply_text(
-        "Sleep well! Water reminders are stopped."
-        if stopped
-        else "No active reminder session was found.",
-        reply_markup=main_keyboard(),
-    )
+    result = await repository.stop_day(user.telegram_user_id, utcnow())
+    if result == "working_out":
+        await update.effective_message.reply_text(
+            "Finish Pump Mode with 🏁 End Workout before going to sleep.",
+            reply_markup=workout_keyboard(),
+        )
+    elif result == "stopped":
+        await update.effective_message.reply_text(
+            "Sleep well! Water reminders are stopped.",
+            reply_markup=sleeping_keyboard(),
+        )
+    else:
+        await update.effective_message.reply_text(
+            "No active reminder session was found.",
+            reply_markup=sleeping_keyboard(),
+        )
+
+
+async def workout_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await private_only(update) or not update.effective_user:
+        return
+    user = await require_user(update, context)
+    if user is None:
+        return
+    config, repository, reminders = components(context)
+    result = await repository.start_workout(user.telegram_user_id, utcnow())
+    if result == "started":
+        await update.effective_message.reply_text(
+            "🏋️ Pump Mode activated! Water breaks every "
+            f"{config.workout_reminder_interval_minutes} minutes. Let’s get moving!",
+            reply_markup=workout_keyboard(),
+        )
+        await reminders.tick()
+    elif result == "not_awake":
+        await update.effective_message.reply_text(
+            "Start your day with /awake before entering Pump Mode.",
+            reply_markup=sleeping_keyboard(),
+        )
+    else:
+        await update.effective_message.reply_text(
+            "Pump Mode is already active! Keep crushing it. 💪",
+            reply_markup=workout_keyboard(),
+        )
+
+
+async def end_workout_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    if not await private_only(update) or not update.effective_user:
+        return
+    user = await require_user(update, context)
+    if user is None:
+        return
+    _, repository, reminders = components(context)
+    result = await repository.end_workout(user.telegram_user_id, utcnow())
+    if result == "ended":
+        await update.effective_message.reply_text(
+            "🏁 Workout complete! Great work. Back to hourly hydration mode.",
+            reply_markup=awake_keyboard(),
+        )
+        await reminders.tick()
+    else:
+        keyboard = awake_keyboard() if user.is_awake else sleeping_keyboard()
+        await update.effective_message.reply_text(
+            "No active workout was found.", reply_markup=keyboard
+        )
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -407,7 +523,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = await require_user(update, context)
     if user is None:
         return
-    status = "running" if user.is_awake else "stopped"
+    config, _, _ = components(context)
+    if user.is_working_out:
+        status = (
+            "workout "
+            f"({config.workout_reminder_interval_minutes}-minute reminders)"
+        )
+    elif user.is_awake:
+        status = "awake (hourly reminders)"
+    else:
+        status = "sleeping"
     lines = [
         f"Reminders: {status}",
         f"Last drink: {format_singapore(user.last_drank_at)}",
@@ -415,7 +540,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ]
     if user.is_awake and user.next_reminder_at:
         lines.insert(1, f"Next reminder: {format_singapore(user.next_reminder_at)}")
-    await update.effective_message.reply_text("\n".join(lines))
+    await update.effective_message.reply_text(
+        "\n".join(lines), reply_markup=state_keyboard(user)
+    )
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -427,10 +554,12 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     config, _, _ = components(context)
     await update.effective_message.reply_text(
         f"Database ID: {user.id}\nName: {user.name}\nTimezone: {user.timezone}\n"
-        f"Interval: {config.reminder_interval_minutes} minutes\n"
+        f"Normal interval: {config.reminder_interval_minutes} minutes\n"
+        f"Workout interval: {config.workout_reminder_interval_minutes} minutes\n"
         f"Snooze: {config.snooze_minutes} minutes\n"
         f"Inactive profiles are deleted after {config.idle_expiry_hours} hours.\n\n"
-        "Change your details with /name New Name or /timezone Area/City."
+        "Change your details with /name New Name or /timezone Area/City.",
+        reply_markup=state_keyboard(user),
     )
 
 
@@ -449,8 +578,11 @@ async def name_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             return
         await repository.set_onboarding_step(user.telegram_user_id, "name_update", utcnow())
-        await repository.set_name(user.telegram_user_id, name, utcnow())
-        await update.effective_message.reply_text(f"I’ll call you {name}.")
+        updated = await repository.set_name(user.telegram_user_id, name, utcnow())
+        await update.effective_message.reply_text(
+            f"I’ll call you {name}.",
+            reply_markup=state_keyboard(updated or user),
+        )
     else:
         await repository.set_onboarding_step(user.telegram_user_id, "name_update", utcnow())
         await update.effective_message.reply_text("What name should I use?")
@@ -481,21 +613,27 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     else:
         next_step = "timezone" if user.name else "name"
     await repository.set_onboarding_step(user.telegram_user_id, next_step, utcnow())
-    await update.effective_message.reply_text("Cancelled.", reply_markup=main_keyboard())
+    await update.effective_message.reply_text(
+        "Cancelled.", reply_markup=state_keyboard(user)
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await private_only(update):
         return
-    await touch_user(update, context)
+    user = await touch_user(update, context)
     await update.effective_message.reply_text(
         "/start – set up the bot\n/awake – start hourly reminders\n"
-        "/sleep – stop reminders\n/status – show reminder and drink status\n"
+        "/workout – start 15-minute Pump Mode reminders\n"
+        "/end_workout – return to hourly reminders\n"
+        "/sleep – stop reminders (end workout first)\n"
+        "/status – show reminder and drink status\n"
         "/settings – view saved settings\n/name – change your name\n"
         "/timezone – change timezone\n/forget_me – delete your saved profile\n"
         "/cancel – cancel input\n/help – show this help\n\n"
         "Only your latest drink time is retained. Hydration needs vary; follow medical "
-        "advice if you have a fluid restriction."
+        "advice if you have a fluid restriction.",
+        reply_markup=state_keyboard(user) if user else ReplyKeyboardRemove(),
     )
 
 
@@ -512,25 +650,61 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if user is None:
         await query.answer("Your session expired. Send /start again.", show_alert=True)
         return
-    config, repository, _ = components(context)
+    config, repository, reminders = components(context)
     data = query.data or ""
-    if data == "sleep":
-        stopped = await repository.stop_day(user.telegram_user_id, utcnow())
-        await query.answer()
-        await query.edit_message_text(
-            "Sleep well! Reminders are stopped."
-            if stopped
-            else "No active session was found."
+    if data.startswith("sleep:"):
+        result = await repository.stop_day_from_reminder(
+            user.telegram_user_id, data.removeprefix("sleep:"), utcnow()
         )
+        if result == "stopped":
+            await query.answer()
+            await query.edit_message_reply_markup(reply_markup=None)
+            await update.effective_message.reply_text(
+                "Sleep well! Water reminders are stopped.",
+                reply_markup=sleeping_keyboard(),
+            )
+        elif result == "working_out":
+            await query.answer(
+                "End Pump Mode before going to sleep.", show_alert=True
+            )
+        else:
+            await query.answer(
+                "This reminder was already handled or is no longer yours.",
+                show_alert=True,
+            )
+        return
+    if data.startswith("end_workout:"):
+        result = await repository.end_workout(
+            user.telegram_user_id,
+            utcnow(),
+            token=data.removeprefix("end_workout:"),
+        )
+        if result == "ended":
+            await query.answer()
+            await query.edit_message_reply_markup(reply_markup=None)
+            await update.effective_message.reply_text(
+                "🏁 Workout complete! Great work. Back to hourly hydration mode.",
+                reply_markup=awake_keyboard(),
+            )
+            await reminders.tick()
+        else:
+            await query.answer(
+                "This workout reminder is stale or already handled.",
+                show_alert=True,
+            )
         return
     if data.startswith("drink:"):
         drank_at = utcnow()
-        changed = await repository.confirm_drink(
+        confirmation = await repository.confirm_drink(
             user.telegram_user_id, data.removeprefix("drink:"), drank_at
         )
-        if changed:
+        if confirmation:
             await query.answer()
-            await query.edit_message_text(drink_confirmation_message(drank_at))
+            await query.edit_message_text(
+                drink_confirmation_message(
+                    drank_at, is_working_out=confirmation.is_working_out
+                )
+            )
         else:
             await query.answer(
                 "This reminder was already handled or is no longer yours.",
@@ -547,7 +721,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if changed:
             await query.answer()
             await query.edit_message_text(
-                f"Snoozed. I’ll remind you again in {config.snooze_minutes} minutes."
+                (
+                    "Power break snoozed! "
+                    if user.is_working_out
+                    else "Snoozed. "
+                )
+                + f"I’ll remind you again in {config.snooze_minutes} minutes."
             )
         else:
             await query.answer(
@@ -570,6 +749,8 @@ async def post_init(application: Application) -> None:
         [
             BotCommand("start", "Set up the bot"),
             BotCommand("awake", "Start hourly reminders"),
+            BotCommand("workout", "Start Pump Mode"),
+            BotCommand("end_workout", "End Pump Mode"),
             BotCommand("sleep", "Stop reminders"),
             BotCommand("status", "Show reminder and drink status"),
             BotCommand("settings", "View saved settings"),
@@ -613,6 +794,8 @@ def build_application(config: Config) -> Application:
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("awake", awake_command))
+    application.add_handler(CommandHandler("workout", workout_command))
+    application.add_handler(CommandHandler("end_workout", end_workout_command))
     application.add_handler(CommandHandler("sleep", sleep_command))
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("settings", settings_command))

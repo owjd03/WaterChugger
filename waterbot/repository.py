@@ -17,6 +17,12 @@ class DueReminder:
     chat_id: int
     name: str
     token: str
+    is_working_out: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DrinkConfirmation:
+    is_working_out: bool
 
 
 class UserRepository:
@@ -161,13 +167,14 @@ class UserRepository:
             if user.is_awake:
                 return user, False
             user.is_awake = True
+            user.is_working_out = False
             user.session_started_at = now
             user.next_reminder_at = now
             user.session_stop_at = now + timedelta(hours=max_awake_hours)
             user.current_reminder_token = None
             return user, True
 
-    async def stop_day(self, telegram_user_id: int, now: datetime) -> bool | None:
+    async def stop_day(self, telegram_user_id: int, now: datetime) -> str | None:
         async with self.sessions.begin() as db:
             user = await db.scalar(
                 select(User)
@@ -176,16 +183,87 @@ class UserRepository:
             )
             if not user:
                 return None
-            was_awake = user.is_awake
-            self._clear_session(user)
             user.last_activity_at = now
             user.updated_at = now
-            return was_awake
+            if user.is_working_out:
+                return "working_out"
+            if not user.is_awake:
+                return "inactive"
+            self._clear_session(user)
+            return "stopped"
+
+    async def stop_day_from_reminder(
+        self, telegram_user_id: int, token: str, now: datetime
+    ) -> str | None:
+        async with self.sessions.begin() as db:
+            user = await db.scalar(
+                select(User)
+                .where(User.telegram_user_id == telegram_user_id)
+                .with_for_update()
+            )
+            if not user:
+                return None
+            user.last_activity_at = now
+            user.updated_at = now
+            if user.is_working_out:
+                return "working_out"
+            if not user.is_awake or user.current_reminder_token != token:
+                return "stale"
+            self._clear_session(user)
+            return "stopped"
+
+    async def start_workout(
+        self, telegram_user_id: int, now: datetime
+    ) -> str | None:
+        async with self.sessions.begin() as db:
+            user = await db.scalar(
+                select(User)
+                .where(User.telegram_user_id == telegram_user_id)
+                .with_for_update()
+            )
+            if not user:
+                return None
+            user.last_activity_at = now
+            user.updated_at = now
+            if not user.is_awake:
+                return "not_awake"
+            if user.is_working_out:
+                return "already_working_out"
+            user.is_working_out = True
+            user.next_reminder_at = now
+            user.current_reminder_token = None
+            return "started"
+
+    async def end_workout(
+        self,
+        telegram_user_id: int,
+        now: datetime,
+        token: str | None = None,
+    ) -> str | None:
+        async with self.sessions.begin() as db:
+            user = await db.scalar(
+                select(User)
+                .where(User.telegram_user_id == telegram_user_id)
+                .with_for_update()
+            )
+            if not user:
+                return None
+            user.last_activity_at = now
+            user.updated_at = now
+            if not user.is_awake or not user.is_working_out:
+                return "not_working_out"
+            if token is not None and user.current_reminder_token != token:
+                return "stale"
+            user.is_working_out = False
+            user.next_reminder_at = now
+            user.current_reminder_token = None
+            return "ended"
 
     async def claim_due(
         self,
         now: datetime,
-        interval_minutes: int,
+        normal_interval_minutes: int,
+        workout_interval_minutes: int,
         idle_threshold: datetime,
     ) -> list[DueReminder]:
         claimed: list[DueReminder] = []
@@ -208,6 +286,11 @@ class UserRepository:
             )
             for user in users:
                 token = str(uuid.uuid4())
+                interval_minutes = (
+                    workout_interval_minutes
+                    if user.is_working_out
+                    else normal_interval_minutes
+                )
                 user.current_reminder_token = token
                 user.next_reminder_at = now + timedelta(minutes=interval_minutes)
                 user.updated_at = now
@@ -218,6 +301,7 @@ class UserRepository:
                         user.chat_id,
                         user.name or "Friend",
                         token,
+                        user.is_working_out,
                     )
                 )
         return claimed
@@ -234,7 +318,7 @@ class UserRepository:
 
     async def confirm_drink(
         self, telegram_user_id: int, token: str, now: datetime
-    ) -> bool | None:
+    ) -> DrinkConfirmation | None:
         async with self.sessions.begin() as db:
             user = await db.scalar(
                 select(User)
@@ -243,13 +327,14 @@ class UserRepository:
             )
             if not user:
                 return None
-            if user.current_reminder_token != token:
-                return False
+            if not user.is_awake or user.current_reminder_token != token:
+                return None
+            is_working_out = user.is_working_out
             user.current_reminder_token = None
             user.last_drank_at = now
             user.last_activity_at = now
             user.updated_at = now
-            return True
+            return DrinkConfirmation(is_working_out=is_working_out)
 
     async def snooze(
         self, telegram_user_id: int, token: str, now: datetime, minutes: int
@@ -302,6 +387,7 @@ class UserRepository:
     @staticmethod
     def _clear_session(user: User) -> None:
         user.is_awake = False
+        user.is_working_out = False
         user.session_started_at = None
         user.next_reminder_at = None
         user.session_stop_at = None

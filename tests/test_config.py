@@ -15,6 +15,7 @@ def test_config_uses_privacy_first_defaults(monkeypatch: pytest.MonkeyPatch) -> 
     base_environment(monkeypatch)
     config = Config.from_env()
     assert config.reminder_interval_minutes == 60
+    assert config.workout_reminder_interval_minutes == 15
     assert config.snooze_minutes == 15
     assert config.max_awake_hours == 18
     assert config.idle_expiry_hours == 24

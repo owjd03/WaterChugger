@@ -1,6 +1,6 @@
 # WaterChugger Telegram Bot
 
-WaterChugger is a Python Telegram bot that sends hourly water reminders while a user is awake. It stores a minimal PostgreSQL profile keyed by the user's numeric Telegram ID so onboarding and active schedules survive restarts.
+WaterChugger is a fun Python Telegram bot that sends hourly water reminders while a user is awake and switches to 15-minute, workout-themed reminders in Pump Mode. It stores a minimal PostgreSQL profile keyed by the user's numeric Telegram ID so onboarding and active schedules survive restarts.
 
 Only the latest confirmed drink time is retained. The bot does not store message contents, phone numbers, Telegram usernames, raw location coordinates, or historical drink events. A complete user row is automatically deleted after 24 hours without user interaction.
 
@@ -8,7 +8,7 @@ This is a general wellness reminder, not medical advice. Anyone with a prescribe
 
 ## What is stored
 
-Each user row contains an increasing internal database ID, Telegram numeric user ID, private chat ID, entered name, timezone, onboarding state, last activity time, latest drink time, and active reminder schedule. Timestamps are stored as timezone-aware instants and displayed in Singapore time.
+Each user row contains an increasing internal database ID, Telegram numeric user ID, private chat ID, entered name, timezone, onboarding state, last activity time, latest drink time, awake/workout state, and active reminder schedule. Timestamps are stored as timezone-aware instants and displayed in Singapore time. Workout history is not retained.
 
 Any command, message, location share, or button press updates `last_activity_at`. Bot-generated reminders do not count as user activity. After 24 hours without input, the row and schedule are deleted and `/start` onboarding is required again.
 
@@ -37,6 +37,7 @@ POSTGRES_PASSWORD=localpassword
 POSTGRES_DB=waterchugger
 
 REMINDER_INTERVAL_MINUTES=60
+WORKOUT_REMINDER_INTERVAL_MINUTES=15
 SNOOZE_MINUTES=15
 MAX_AWAKE_HOURS=18
 IDLE_EXPIRY_HOURS=24
@@ -87,7 +88,9 @@ The test database does not use the development database volume.
 
 - `/start` — create or resume onboarding
 - `/awake` — start hourly reminders
-- `/sleep` — stop reminders
+- `/workout` — enter Pump Mode with 15-minute reminders
+- `/end_workout` — leave Pump Mode and return to hourly reminders
+- `/sleep` — stop reminders after ending any active workout
 - `/status` — show the schedule and latest drink time in Singapore time
 - `/settings` — show the database ID and saved settings
 - `/name New Name` — change the saved name
@@ -96,7 +99,13 @@ The test database does not use the development database volume.
 - `/cancel` — cancel the current input step
 - `/help` — show command help
 
-**Drank it** records only the latest confirmation timestamp. **Snooze 15 min** persists the delayed reminder. Active schedules resume after restarts and deployments.
+The bottom keyboard adapts to the current mode: **I'm awake** while sleeping, **Pump Mode / I'm going to sleep** while awake, and **End Workout** during a workout. Workout reminders keep **Drank it** and **Snooze 15 min**, with **End Workout** replacing the sleep action.
+
+**Drank it** records only the latest confirmation timestamp. **Snooze 15 min** persists the delayed reminder. Active schedules and workout mode resume after restarts and deployments.
+
+## Customize the fun messages
+
+Edit `waterbot/messages.py` to change the hardcoded normal encouragements, workout reminder prompts, and workout drink confirmations. Keep each message quoted and comma-separated inside its tuple. Message edits require rebuilding or redeploying the bot; reminder timings remain in `.env` locally and Railway Variables in production.
 
 ## Inspect the local database
 
@@ -109,7 +118,7 @@ docker compose exec db psql -U waterchugger -d waterchugger
 Useful read-only queries:
 
 ```sql
-SELECT id, telegram_user_id, name, is_awake,
+SELECT id, telegram_user_id, name, is_awake, is_working_out,
        last_activity_at AT TIME ZONE 'Asia/Singapore' AS last_activity_sgt,
        last_drank_at AT TIME ZONE 'Asia/Singapore' AS last_drank_sgt
 FROM users
@@ -147,6 +156,7 @@ second bot service with the same Telegram token.
 TELEGRAM_BOT_TOKEN=your_real_botfather_token
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 REMINDER_INTERVAL_MINUTES=60
+WORKOUT_REMINDER_INTERVAL_MINUTES=15
 SNOOZE_MINUTES=15
 MAX_AWAKE_HOURS=18
 IDLE_EXPIRY_HOURS=24
@@ -166,6 +176,8 @@ not need a public database URL or database port.
    the same Telegram token.
 
 Railway uses the repository `Dockerfile`. The pre-deploy command in `railway.toml` runs `alembic upgrade head`, and the image starts with `python main.py`.
+
+The workout migration only adds `is_working_out` with a default of `false` and a state-safety constraint. It does not delete or recreate the `users` table, so existing IDs, profiles, latest drink times, awake states, and reminder schedules remain intact. Existing users begin in normal hourly mode after the migration and do not need to repeat `/start`.
 
 Keep exactly one bot replica. Telegram long polling must not run from multiple instances with the same token.
 
@@ -187,8 +199,10 @@ with the bot.
 1. Check the existing bot service's deployment logs for a successful Alembic
    migration and bot startup.
 2. Complete `/start`, send `/awake`, and confirm a reminder.
-3. Check `/status` for the latest drink timestamp.
-4. Redeploy and verify that the active schedule remains available.
-5. Use `/forget_me` and confirm `/status` requires `/start` again.
+3. Enter Pump Mode and verify an immediate workout reminder followed by a 15-minute schedule.
+4. End the workout and verify an immediate normal reminder followed by an hourly schedule.
+5. Check `/status` for the mode and latest drink timestamp.
+6. Redeploy during Pump Mode and verify that the mode and schedule recover.
+7. Use `/forget_me` and confirm `/status` requires `/start` again.
 
 For a quick expiry test in a non-production environment, temporarily reduce `IDLE_EXPIRY_HOURS`, wait for the cleanup job, and confirm that the row is removed. Restore it to `24` afterward.
